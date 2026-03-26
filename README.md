@@ -6,9 +6,8 @@ This app is built using Java + Chaquopy (Python) and integrates a custom speed t
 
 ---
 
-## Overview
-
-Some internet service providers throttle bandwidth during idle periods. This application helps mitigate that behavior by periodically triggering a lightweight speed test process, encouraging the network to maintain peak performance.
+> [!NOTE]
+> Some internet service providers throttle bandwidth during idle periods. This application helps mitigate that behavior by periodically triggering a lightweight speed test process, encouraging the network to maintain peak performance.
 
 The app runs a loop-based trigger system with configurable intervals and supports skipping heavy download/upload tests to reduce data usage.
 
