@@ -1,9 +1,15 @@
 package com.rdevzph.speedtesttriggerandroid;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.text.method.ScrollingMovementMethod;
 import android.view.View;
 import android.widget.Button;
@@ -12,25 +18,20 @@ import android.widget.EditText;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
-import com.chaquo.python.PyException;
-import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
 import com.chaquo.python.android.AndroidPlatform;
 import com.google.android.material.appbar.MaterialToolbar;
 
-import org.json.JSONObject;
-
-import java.util.Objects;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-
-import android.content.SharedPreferences;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -55,17 +56,14 @@ public class MainActivity extends AppCompatActivity {
     private Button startButton;
     private Button stopButton;
 
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
-
-    private volatile boolean running = false;
-
     private SharedPreferences peakPrefs;
 
     private TextView peakDownloadText;
     private TextView peakUploadText;
     private TextView peakServerText;
     private TextView peakPingText;
+
+    private boolean receiverRegistered = false;
 
     private static final String PREFS_NAME = "speedtest_peaks";
     private static final String KEY_PEAK_DOWNLOAD_MBPS = "peak_download_mbps";
@@ -75,6 +73,62 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_PEAK_SERVER_TEXT = "peak_server_text";
     private static final String KEY_PEAK_PING_MS = "peak_ping_ms";
     private static final String KEY_PEAK_PING_TEXT = "peak_ping_text";
+
+    private static final String SERVICE_PREFS = "speedtest_service_state";
+    private static final String KEY_SERVICE_RUNNING = "service_running";
+
+    private final ActivityResultLauncher<String> notificationPermissionLauncher =
+            registerForActivityResult(new ActivityResultContracts.RequestPermission(), isGranted -> {
+                if (!isGranted) {
+                    appendLog("Notification permission denied. Foreground notification may not appear properly.");
+                }
+            });
+
+    private final BroadcastReceiver serviceUpdateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null) return;
+
+            String status = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_STATUS));
+            String isp = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_ISP));
+            String ip = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_IP));
+            String server = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_SERVER));
+            String ping = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_PING));
+            String mode = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_MODE));
+            String download = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_DOWNLOAD));
+            String upload = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_UPLOAD));
+            String result = safe(intent.getStringExtra(SpeedtestForegroundService.EXTRA_RESULT));
+            boolean isRunning = intent.getBooleanExtra(SpeedtestForegroundService.EXTRA_RUNNING, false);
+
+            setText(statusText, status);
+            setText(ispText, isp + " (" + ip + ")");
+            setText(serverText, server);
+            setText(pingText, ping);
+            setText(modeText, mode);
+            setText(downloadText, download);
+            setText(uploadText, upload);
+            setText(resultText, result);
+
+            if (!"-".equals(server) && !"-".equals(ping)) {
+                updatePeakData(server, ping, download, upload);
+            }
+
+            updateButtons(isRunning);
+
+            if ("Updated".equalsIgnoreCase(status)) {
+                appendLog("ISP: " + isp + " (" + ip + ")");
+                appendLog("Best Server: " + server);
+                appendLog("Ping: " + ping);
+                appendLog("Download: " + download);
+                appendLog("Upload: " + upload);
+                appendLog("Result: " + result);
+            } else if ("Retrying".equalsIgnoreCase(status)) {
+                appendLog("Retrying soon...");
+            } else if ("Stopped".equalsIgnoreCase(status)) {
+                appendLog("Process stopped.");
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -93,9 +147,23 @@ public class MainActivity extends AppCompatActivity {
         setupUi();
         resetFields();
         loadPeakData();
+        requestNotificationPermissionIfNeeded();
 
-        startButton.setOnClickListener(v -> startLoop());
-        stopButton.setOnClickListener(v -> stopLoop());
+        startButton.setOnClickListener(v -> startForegroundMonitor());
+        stopButton.setOnClickListener(v -> stopForegroundMonitor());
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        registerServiceReceiverIfNeeded();
+        syncButtonsWithServiceState();
+    }
+
+    @Override
+    protected void onStop() {
+        unregisterServiceReceiverIfNeeded();
+        super.onStop();
     }
 
     private void bindViews() {
@@ -181,35 +249,78 @@ public class MainActivity extends AppCompatActivity {
         setText(logText, "");
     }
 
-    private void startLoop() {
-        if (running) return;
+    private void startForegroundMonitor() {
+        Intent intent = new Intent(this, SpeedtestForegroundService.class);
+        intent.setAction(SpeedtestForegroundService.ACTION_START);
+        intent.putExtra(SpeedtestForegroundService.EXTRA_INTERVAL, getInterval());
+        intent.putExtra(SpeedtestForegroundService.EXTRA_NO_DOWNLOAD, noDownloadCheck.isChecked());
+        intent.putExtra(SpeedtestForegroundService.EXTRA_NO_UPLOAD, noUploadCheck.isChecked());
 
-        running = true;
-        resetFields();
-        appendLog("Loop started. Interval: " + getInterval() + "s | Mode: " + getModeLabel());
+        ContextCompat.startForegroundService(this, intent);
+
+        setText(statusText, "Starting...");
+        setText(modeText, getModeLabel());
+        setText(resultText, "Preparing speed monitor");
+        appendLog("Foreground monitor started. Interval: " + getInterval() + "s | Mode: " + getModeLabel());
         updateButtons(true);
+    }
 
-        executor.execute(() -> {
-            while (running) {
-                String loopResult = runSpeedtestOnce();
-                if (!running) break;
+    private void stopForegroundMonitor() {
+        Intent intent = new Intent(this, SpeedtestForegroundService.class);
+        intent.setAction(SpeedtestForegroundService.ACTION_STOP);
+        startService(intent);
 
-                int waitTime = "retry_soon".equals(loopResult) ? 5 : getInterval();
+        setText(statusText, "Stopped");
+        setText(resultText, "Stopped");
+        appendLog("Process stopped by user.");
+        updateButtons(false);
+    }
 
-                for (int remaining = waitTime; remaining > 0 && running; remaining--) {
-                    final int countdown = remaining;
-                    mainHandler.post(() -> setText(statusText, "Waiting " + countdown + "s"));
-                    sleepOneSecond();
-                }
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private void registerServiceReceiverIfNeeded() {
+        if (receiverRegistered) return;
+
+        IntentFilter filter = new IntentFilter(SpeedtestForegroundService.BROADCAST_UPDATE);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(serviceUpdateReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(serviceUpdateReceiver, filter);
+        }
+
+        receiverRegistered = true;
+    }
+
+    private void unregisterServiceReceiverIfNeeded() {
+        if (!receiverRegistered) return;
+
+        try {
+            unregisterReceiver(serviceUpdateReceiver);
+        } catch (Exception ignored) {
+        }
+
+        receiverRegistered = false;
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS);
             }
+        }
+    }
 
-            mainHandler.post(() -> {
-                if (!"Stopped".contentEquals(statusText.getText())) {
-                    setText(statusText, "Stopped");
-                }
-                updateButtons(false);
-            });
-        });
+    private void syncButtonsWithServiceState() {
+        boolean isRunning = getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE)
+                .getBoolean(KEY_SERVICE_RUNNING, false);
+
+        updateButtons(isRunning);
+
+        if (!isRunning) {
+            setText(statusText, "Stopped");
+            setText(resultText, "Stopped");
+        }
     }
 
     private void loadPeakData() {
@@ -260,7 +371,7 @@ public class MainActivity extends AppCompatActivity {
 
         if (changed) {
             editor.apply();
-            mainHandler.post(this::loadPeakData);
+            loadPeakData();
         }
     }
 
@@ -295,100 +406,6 @@ public class MainActivity extends AppCompatActivity {
         return String.format(Locale.US, "%s: %.2f Mbps | %s", label, mbps, serverLabel);
     }
 
-    private void stopLoop() {
-        running = false;
-        setText(statusText, "Stopped");
-        setText(resultText, "Stopped");
-        appendLog("Process stopped by user.");
-        updateButtons(false);
-    }
-
-    private String runSpeedtestOnce() {
-        mainHandler.post(() -> {
-            setText(statusText, "Checking ISP and best server");
-            setText(modeText, getModeLabel());
-            setText(downloadText, "-");
-            setText(uploadText, "-");
-            setText(resultText, "-");
-        });
-
-        try {
-            Python py = Python.getInstance();
-            PyObject module = py.getModule("speedtest_bridge");
-            PyObject result = module.callAttr(
-                    "run_speedtest",
-                    noDownloadCheck.isChecked(),
-                    noUploadCheck.isChecked()
-            );
-
-            JSONObject json = new JSONObject(result.toString());
-            boolean ok = json.optBoolean("ok", false);
-
-            if (!ok) {
-                String error = json.optString("error", "Unknown error");
-                appendLog("Error: " + error);
-
-                mainHandler.post(() -> {
-                    setText(statusText, "Retrying");
-                    setText(resultText, "Retrying soon");
-                });
-
-                return "retry_soon";
-            }
-
-            String isp = json.optString("isp", "-");
-            String ip = json.optString("ip", "-");
-            String sponsor = json.optString("sponsor", "-");
-            String server = json.optString("server", "-");
-            String ping = json.optString("ping", "-");
-            String mode = json.optString("mode", getModeLabel());
-            String download = json.optString("download_text", "Skipped");
-            String upload = json.optString("upload_text", "Skipped");
-            String resultTextValue = json.optString("result_text", "Updated");
-
-            mainHandler.post(() -> {
-                setText(statusText, "Updated");
-                setText(ispText, isp + " (" + ip + ")");
-                setText(serverText, sponsor + " - " + server);
-                setText(pingText, ping + " ms");
-                setText(modeText, mode);
-                setText(downloadText, download);
-                setText(uploadText, upload);
-                setText(resultText, resultTextValue);
-            });
-
-            appendLog("ISP: " + isp + " (" + ip + ")");
-            appendLog("Best Server: " + sponsor + " - " + server);
-            appendLog("Ping: " + ping + " ms");
-            appendLog("Result: " + resultTextValue);
-            String serverLabel = sponsor + " - " + server;
-            String pingLabel = ping + " ms";
-            updatePeakData(serverLabel, pingLabel, download, upload);
-
-            return "ok";
-
-        } catch (PyException pyException) {
-            appendLog("Python error: " + pyException.getMessage());
-
-            mainHandler.post(() -> {
-                setText(statusText, "Retrying");
-                setText(resultText, "Retrying soon");
-            });
-
-            return "retry_soon";
-
-        } catch (Exception exception) {
-            appendLog("App error: " + exception.getMessage());
-
-            mainHandler.post(() -> {
-                setText(statusText, "Retrying");
-                setText(resultText, "Retrying soon");
-            });
-
-            return "retry_soon";
-        }
-    }
-
     private int getInterval() {
         try {
             int value = Integer.parseInt(intervalInput.getText().toString().trim());
@@ -413,7 +430,9 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setText(TextView view, String value) {
-        view.setText(value);
+        if (view != null) {
+            view.setText(value != null ? value : "-");
+        }
     }
 
     private void updateButtons(boolean isRunning) {
@@ -425,28 +444,23 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void appendLog(String message) {
-        mainHandler.post(() -> {
-            logText.append(message + "\n");
+        if (message == null || message.trim().isEmpty()) return;
 
-            View parent = (View) logText.getParent();
-            if (parent instanceof ScrollView) {
-                parent.post(() -> ((ScrollView) parent).fullScroll(View.FOCUS_DOWN));
-            }
-        });
+        logText.append(message + "\n");
+
+        View parent = (View) logText.getParent();
+        if (parent instanceof ScrollView) {
+            parent.post(() -> ((ScrollView) parent).fullScroll(View.FOCUS_DOWN));
+        }
     }
 
-    private void sleepOneSecond() {
-        try {
-            Thread.sleep(1000);
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
+    private String safe(String value) {
+        return value == null || value.trim().isEmpty() ? "-" : value;
     }
 
     @Override
     protected void onDestroy() {
+        unregisterServiceReceiverIfNeeded();
         super.onDestroy();
-        running = false;
-        executor.shutdownNow();
     }
 }
