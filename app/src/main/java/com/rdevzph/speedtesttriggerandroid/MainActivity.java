@@ -80,6 +80,7 @@ public class MainActivity extends AppCompatActivity {
     private final ActivityResultLauncher<String> notificationPermissionLauncher =
             registerForActivityResult(new ActivityResultContracts.RequestPermission(), isGranted -> {
                 if (!isGranted) {
+                    clearLogs();
                     appendLog("Notification permission denied. Foreground notification may not appear properly.");
                 }
             });
@@ -116,6 +117,7 @@ public class MainActivity extends AppCompatActivity {
             updateButtons(isRunning);
 
             if ("Updated".equalsIgnoreCase(status)) {
+                clearLogs();
                 appendLog("ISP: " + isp + " (" + ip + ")");
                 appendLog("Best Server: " + server);
                 appendLog("Ping: " + ping);
@@ -123,8 +125,10 @@ public class MainActivity extends AppCompatActivity {
                 appendLog("Upload: " + upload);
                 appendLog("Result: " + result);
             } else if ("Retrying".equalsIgnoreCase(status)) {
+                clearLogs();
                 appendLog("Retrying soon...");
             } else if ("Stopped".equalsIgnoreCase(status)) {
+                clearLogs();
                 appendLog("Process stopped.");
             }
         }
@@ -246,10 +250,12 @@ public class MainActivity extends AppCompatActivity {
         setText(downloadText, "-");
         setText(uploadText, "-");
         setText(resultText, "-");
-        setText(logText, "");
+        clearLogs();
     }
 
     private void startForegroundMonitor() {
+        clearLogs();
+
         Intent intent = new Intent(this, SpeedtestForegroundService.class);
         intent.setAction(SpeedtestForegroundService.ACTION_START);
         intent.putExtra(SpeedtestForegroundService.EXTRA_INTERVAL, getInterval());
@@ -272,6 +278,7 @@ public class MainActivity extends AppCompatActivity {
 
         setText(statusText, "Stopped");
         setText(resultText, "Stopped");
+        clearLogs();
         appendLog("Process stopped by user.");
         updateButtons(false);
     }
@@ -441,6 +448,10 @@ public class MainActivity extends AppCompatActivity {
         intervalInput.setEnabled(!isRunning);
         noDownloadCheck.setEnabled(!isRunning);
         noUploadCheck.setEnabled(!isRunning);
+    }
+
+    private void clearLogs() {
+        setText(logText, "");
     }
 
     private void appendLog(String message) {
